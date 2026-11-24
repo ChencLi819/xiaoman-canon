@@ -11,12 +11,22 @@ import cloud.micoten.camlink.ptpip.PtpOp
 import cloud.micoten.camlink.ptpip.PtpProp
 import cloud.micoten.camlink.ptpip.PtpRc
 import cloud.micoten.camlink.ptpip.PtpResult
+import cloud.micoten.camlink.ptpip.focusResult
 import cloud.micoten.camlink.util.AppLog
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+
+internal enum class FocusOutcome {
+    FOCUSED,
+    FAILED,
+    UNCONFIRMED,
+    CANCELLED,
+}
 
 /**
  * 相机上的一个文件条目（对应 `PTPCANONFolderEntry`）。
@@ -111,6 +121,7 @@ class EosCamera(private val conn: PtpIpConnection) {
 
         /** 半按之后等 FocusInfo 的上限，与 libgphoto2 的 500ms 一致。 */
         private const val FOCUS_WAIT_MS = 500L
+        private const val AF_RESULT_TIMEOUT_MS = 3_000L
 
         /** 相机状态里的“忙”。`eos_camerastatus == 1` 时拍摄会被相机拒掉。 */
         private const val STATUS_BUSY = 1
@@ -184,6 +195,12 @@ class EosCamera(private val conn: PtpIpConnection) {
     private var evfOutputs: List<Long>? = null
     private var recordingTargets: List<Long>? = null
     private var nativeAfActive = false
+    @Volatile private var activeFocus: FocusAttempt? = null
+    private val previewFocus = TouchFocusFeedback()
+    private var focusGeometry: FocusGeometry? = null
+    internal val isFocusing: Boolean
+        get() = activeFocus != null
+
     private var lastLiveKeepAlive = 0L
     private var bulbOpen = false
 
@@ -307,6 +324,7 @@ class EosCamera(private val conn: PtpIpConnection) {
                         parametersChanged = true
                         when (e.propCode) {
                             PtpProp.AE_MODE_DIAL -> dialChanged = true
+                            PtpProp.EVF_OUTPUT_DEVICE -> clearPreviewFocus()
                             PtpProp.AUTO_EXPOSURE_MODE -> {
                                 exposureModeChanged =
                                     previous != null ||
@@ -368,6 +386,7 @@ class EosCamera(private val conn: PtpIpConnection) {
         }
         if (shootingMode != previousMode) {
             exposureOptions.clear()
+            clearPreviewFocus()
             parametersChanged = true
         }
         for (e in events) {
@@ -377,6 +396,18 @@ class EosCamera(private val conn: PtpIpConnection) {
                     exposureOptions[e.propCode] = values
                     parametersChanged = true
                 }
+            }
+        }
+        activeFocus?.let { attempt ->
+            if (!isAutoFocus || attempt.movie != isMovieMode) {
+                attempt.result.complete(FocusOutcome.CANCELLED)
+            } else {
+                events
+                    .firstNotNullOfOrNull { event ->
+                        if (attempt.useLiveAf && event is CameraEvent.FocusPointEx) null
+                        else event.focusResult()
+                    }
+                    ?.let(attempt::report)
             }
         }
         syncRecordingClock()
@@ -413,6 +444,11 @@ class EosCamera(private val conn: PtpIpConnection) {
         }
 
         val supportedCodes = available.toHashSet()
+        if (kind == ParamKind.EXPOSURE_COMP) {
+            val choices = EosValues.EXPOSURE_COMP.filter { it.code.toLong() in supportedCodes }
+            cachedChoices[kind] = CachedChoices(profile, available, choices)
+            return choices
+        }
         val aliasesByLabel = HashMap<String, Choice>()
         for (choice in EosValues.of(kind)) {
             if (choice.code.toLong() in supportedCodes)
@@ -510,8 +546,10 @@ class EosCamera(private val conn: PtpIpConnection) {
         while (previewFallbacks.isNotEmpty()) {
             val candidate = previewFallbacks.first()
             try {
-                if (value(PtpProp.EVF_OUTPUT_DEVICE) != candidate)
+                if (value(PtpProp.EVF_OUTPUT_DEVICE) != candidate) {
                     setProp(PtpProp.EVF_OUTPUT_DEVICE, candidate)
+                    clearPreviewFocus()
+                }
                 previewFallbacks.removeFirst()
                 AppLog.i(TAG, "取景输出 0x%X，等待画面".format(candidate))
                 return true
@@ -540,9 +578,15 @@ class EosCamera(private val conn: PtpIpConnection) {
         }
         previousLiveOutput = null
         previewFallbacks.clear()
+        clearPreviewFocus()
         if (restoreEvfMode && conn.isConnected && !isMovieMode) setProp(PtpProp.EVF_MODE, 0)
         restoreEvfMode = false
         AppLog.i(TAG, "实时取景已关闭")
+    }
+
+    private fun clearPreviewFocus() {
+        focusGeometry = null
+        previewFocus.clear()
     }
 
     /** 定期保活，避免每帧额外占用一次命令通道。 */
@@ -567,7 +611,14 @@ class EosCamera(private val conn: PtpIpConnection) {
             if (r.code == PtpRc.DEVICE_BUSY) return PreviewPoll.Miss.BUSY
             throw PtpException("取景帧获取失败：${r.describe()}", r.code)
         }
-        return parsePreviewJpeg(r.data)?.let { PreviewPoll.Frame(it) } ?: PreviewPoll.Miss.EMPTY
+        val jpeg = parsePreviewJpeg(r.data, focusGeometry) ?: return PreviewPoll.Miss.EMPTY
+        focusGeometry = jpeg.focusGeometry
+        when (previewFocus.observe(jpeg)) {
+            TouchFocusStatus.FOCUSED -> activeFocus?.report(true)
+            TouchFocusStatus.FAILED -> activeFocus?.report(false)
+            else -> Unit
+        }
+        return PreviewPoll.Frame(jpeg)
     }
 
     // --------------------------------------------------------------- 快门
@@ -586,7 +637,7 @@ class EosCamera(private val conn: PtpIpConnection) {
         halfPressAf: Boolean = true,
         onAccepted: () -> Unit = {},
     ): List<CameraFile> {
-        while (shutterSequenceActive && conn.isConnected) delay(20)
+        while ((shutterSequenceActive || isFocusing) && conn.isConnected) delay(20)
         check(!captureInProgress) { "已有拍摄任务" }
         captureInProgress = true
         shutterSequenceActive = true
@@ -603,7 +654,6 @@ class EosCamera(private val conn: PtpIpConnection) {
         halfPressAf: Boolean,
         onAccepted: () -> Unit,
     ): List<CameraFile> {
-        finishShutterRelease()
         drainEvents(maxBatches = 2)
         if (cameraStatus == STATUS_BUSY) {
             delay(100)
@@ -622,25 +672,35 @@ class EosCamera(private val conn: PtpIpConnection) {
             }
             if (bulbOpen || usesBulb) throw PtpException("B 门模式请使用 B 门快门")
             var fullPressed = false
+            var pressedForCapture = false
+            var attemptBusy: PtpException? = null
             val requestAf = halfPressAf && !isManualFocus
             try {
+                finishShutterRelease()
                 clearRemoteAf()
                 prepareCaptureDestination()
                 if (requestAf) {
                     releaseOn(1)
+                    pressedForCapture = true
                     waitFocus()
                     if (isMovieMode || usesBulb) throw PtpException("机身已切换拍摄模式，请重新按快门")
                 }
                 releaseOn(if (requestAf) 2 else 3, autofocus = requestAf)
+                pressedForCapture = true
                 captureFiles = files
                 fullPressed = true
             } catch (e: PtpException) {
                 if (e.ptpCode != PtpRc.DEVICE_BUSY) throw e
-                busyReplies++
-                lastBusy = e
-                AppLog.d(TAG, "等待机身就绪后重试快门：${e.message}")
+                attemptBusy = e
             } finally {
-                finishShutterRelease(fullPressed)
+                if (pressedForCapture) {
+                    try {
+                        finishShutterRelease(fullPressed)
+                    } catch (e: PtpException) {
+                        if (fullPressed || e.ptpCode != PtpRc.DEVICE_BUSY) throw e
+                        attemptBusy = e
+                    }
+                }
             }
             if (fullPressed) {
                 shutterSequenceActive = false
@@ -652,6 +712,10 @@ class EosCamera(private val conn: PtpIpConnection) {
                     )
                 return waitForNewObjects(files, timeout)
             }
+            val busy = checkNotNull(attemptBusy)
+            lastBusy = busy
+            busyReplies++
+            AppLog.d(TAG, "等待机身就绪后重试快门：${busy.message}")
             val remaining = deadline - SystemClock.elapsedRealtime()
             if (remaining <= 0) continue
             delay(minOf(busyReplies * 60L, 240L, remaining))
@@ -685,7 +749,7 @@ class EosCamera(private val conn: PtpIpConnection) {
         }
         if (failure != null) {
             val status = if (fullPressAccepted) "机身已接受拍摄，快门释放未确认" else "未确认快门已释放，已暂停继续拍摄"
-            throw PtpException("$status：${failure.message}", cause = failure)
+            throw PtpException("$status：${failure.message}", failure.ptpCode, failure)
         }
     }
 
@@ -707,33 +771,22 @@ class EosCamera(private val conn: PtpIpConnection) {
         }
     }
 
-    /**
-     * 半按后等合焦。
-     *
-     * OLC 的对焦字节是 6 字节十六进制串：`000000000101` 表示合焦， `000000000200` / `000000000000` 表示 AF
-     * 失败。手动对焦模式下没有这套逻辑，直接放行。
-     */
-    private suspend fun waitFocus(): Boolean {
+    /** 半按后等待机身确认。超时保留未确认状态。 */
+    private suspend fun waitFocus(timeoutMs: Long = FOCUS_WAIT_MS): Boolean? {
         if (isManualFocus) return true
-        val deadline = SystemClock.elapsedRealtime() + FOCUS_WAIT_MS
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             val events = drainEvents(maxBatches = 2)
-            if (events.any(::isFocusOk)) return true
-            // Let the camera apply its own AF release-priority setting on full press.
-            if (events.any { it is CameraEvent.AfResult && it.result != 0 }) return false
+            events
+                .firstNotNullOfOrNull { it.focusResult() }
+                ?.let {
+                    return it
+                }
             delay(20)
         }
         AppLog.d(TAG, "机身未回报合焦结果")
-        return false
+        return null
     }
-
-    private fun isFocusOk(e: CameraEvent): Boolean =
-        when (e) {
-            is CameraEvent.Olc -> e.focusInfo?.endsWith("0101") == true
-            is CameraEvent.FocusPointEx -> e.selected > 0
-            is CameraEvent.AfResult -> e.result == 0
-            else -> false
-        }
 
     private suspend fun waitForNewObjects(
         files: Map<Int, CameraFile>,
@@ -778,39 +831,67 @@ class EosCamera(private val conn: PtpIpConnection) {
 
     // ---------------------------------------------------------------- 对焦
 
-    /** 立刻自动对焦一次（`DoAf 0x9154`，无参）。 */
-    suspend fun afDrive(): Boolean? {
-        finishShutterRelease()
-        if (liveViewActive) {
-            val r = conn.command(PtpOp.EOS_DO_AF)
-            if (r.ok) {
-                nativeAfActive = true
-                return null
-            }
-            if (r.code != PtpRc.OPERATION_NOT_SUPPORTED) {
-                throw PtpException("自动对焦失败：${r.describe()}", r.code)
-            }
-        }
-        shutterSequenceActive = true
-        return try {
-            drainEvents(maxBatches = 1)
-            releaseOn(1)
-            waitFocus().takeIf { it }
-        } finally {
-            try {
-                finishShutterRelease()
-            } finally {
-                shutterSequenceActive = false
-            }
+    private class FocusAttempt(val movie: Boolean, val useLiveAf: Boolean) {
+        val result = CompletableDeferred<FocusOutcome>()
+
+        fun report(focused: Boolean) {
+            result.complete(if (focused) FocusOutcome.FOCUSED else FocusOutcome.FAILED)
         }
     }
 
-    /** 点选对焦。[x] / [y] 是取景画面内的坐标，需要按相机的取景分辨率给。 `type` 传 1 表示立即执行 AF。 */
-    fun touchAf(x: Int, y: Int) {
+    internal fun receiveAfResult(code: Int) {
+        activeFocus?.report(code == 0)
+    }
+
+    /** 取景时使用专用实时 AF，光学取景时使用半按。 */
+    internal suspend fun focus(target: FocusPoint? = null): FocusOutcome {
+        if (isFocusing || shutterSequenceActive) return FocusOutcome.CANCELLED
         finishShutterRelease()
-        val r = conn.command(PtpOp.EOS_TOUCH_AF_POSITION, 1, x, y)
-        if (!r.ok) throw PtpException("点选对焦失败：${r.describe()}", r.code)
-        nativeAfActive = true
+        clearRemoteAf()
+        drainEvents(maxBatches = 2)
+        if (!isAutoFocus) return FocusOutcome.CANCELLED
+        val movie = isMovieMode
+        val useLiveAf = liveViewActive
+        if ((movie || target != null) && !useLiveAf) {
+            throw PtpException("请打开实时取景后再对焦")
+        }
+        if (target != null) {
+            if (target.geometry != focusGeometry) {
+                throw PtpException("取景对焦坐标已更新，请重新点按")
+            }
+            val selected = conn.command(PtpOp.EOS_TOUCH_AF_POSITION, 3, target.x, target.y)
+            if (!selected.ok) throw PtpException("设置对焦点失败：${selected.describe()}", selected.code)
+            AppLog.d(
+                TAG,
+                "取景对焦点 ${target.x}, ${target.y} / ${target.geometry.width}×${target.geometry.height}",
+            )
+            drainEvents(maxBatches = 1)
+            if (!isAutoFocus || isMovieMode != movie) return FocusOutcome.CANCELLED
+            if (target.geometry != focusGeometry) {
+                throw PtpException("取景对焦坐标已更新，请重新点按")
+            }
+        }
+        val attempt = FocusAttempt(movie, useLiveAf)
+        activeFocus = attempt
+        return try {
+            if (useLiveAf) {
+                val response = conn.command(PtpOp.EOS_DO_AF)
+                if (!response.ok) throw PtpException("自动对焦失败：${response.describe()}", response.code)
+                nativeAfActive = true
+            } else {
+                releaseOn(1)
+            }
+            withTimeoutOrNull(AF_RESULT_TIMEOUT_MS) { attempt.result.await() }
+                ?: FocusOutcome.UNCONFIRMED
+        } finally {
+            try {
+                if (conn.isConnected) {
+                    if (useLiveAf) clearRemoteAf() else finishShutterRelease()
+                }
+            } finally {
+                activeFocus = null
+            }
+        }
     }
 
     private fun clearRemoteAf() {
@@ -1201,6 +1282,7 @@ class EosCamera(private val conn: PtpIpConnection) {
         out: java.io.OutputStream,
         beforeRead: suspend () -> Unit = {},
         completeTransfer: Boolean = true,
+        previewPriority: () -> Boolean = { false },
         onProgress: ((done: Long, total: Long) -> Unit)? = null,
     ): Long {
         var written = 0L
@@ -1225,12 +1307,20 @@ class EosCamera(private val conn: PtpIpConnection) {
 
         val requested = file.handle in transferRequests
         var partialOp = if (requested) PtpOp.EOS_GET_PARTIAL_OBJECT else PtpOp.GET_PARTIAL_OBJECT
+        var previewBlockSize = BLOB_SIZE / 8
         if (total != null) {
             while (written < total) {
                 beforeRead()
                 val offset = written
-                val blockSize = if (liveViewActive) BLOB_SIZE / 4 else BLOB_SIZE
+                val prioritizePreview = liveViewActive && previewPriority()
+                val blockSize =
+                    when {
+                        prioritizePreview -> previewBlockSize
+                        liveViewActive -> BLOB_SIZE / 4
+                        else -> BLOB_SIZE
+                    }
                 val size = minOf(total - offset, blockSize.toLong()).toInt()
+                val startedAt = if (prioritizePreview) SystemClock.elapsedRealtime() else 0L
                 var result = read(partialOp, file.handle, offset.toInt(), size)
                 if (
                     written == 0L &&
@@ -1243,6 +1333,13 @@ class EosCamera(private val conn: PtpIpConnection) {
                 if (written == 0L && result.code == PtpRc.OPERATION_NOT_SUPPORTED) break
                 result.requireOk()
                 if (written - offset !in 1L..size.toLong()) throw PtpException("相机返回的下载分块长度异常")
+                if (prioritizePreview && written - offset == blockSize.toLong()) {
+                    previewBlockSize =
+                        nextPreviewDownloadBlock(
+                            blockSize,
+                            SystemClock.elapsedRealtime() - startedAt,
+                        )
+                }
                 if (written < total) yield()
             }
         }
@@ -1278,6 +1375,14 @@ class EosCamera(private val conn: PtpIpConnection) {
 }
 
 // ------------------------------------------------------------------ 小工具
+
+/** 在一次相机事务占用时间较长时缩小下一块，让取景尽快重新拿到通道。 */
+internal fun nextPreviewDownloadBlock(blockSize: Int, elapsedMs: Long): Int =
+    when {
+        elapsedMs > 32L -> (blockSize / 2).coerceAtLeast(64 * 1024)
+        elapsedMs < 12L -> (blockSize * 2).coerceAtMost(256 * 1024)
+        else -> blockSize
+    }
 
 internal fun stillCaptureTimeoutMs(shutterCode: Int?, driveMode: Int?): Long {
     val exposureSeconds =

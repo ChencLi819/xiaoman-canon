@@ -19,8 +19,11 @@ import cloud.micoten.camlink.camera.Choice
 import cloud.micoten.camlink.camera.EosCamera
 import cloud.micoten.camlink.camera.EosValues
 import cloud.micoten.camlink.camera.ExposureMode
+import cloud.micoten.camlink.camera.FocusOutcome
+import cloud.micoten.camlink.camera.FocusPoint
 import cloud.micoten.camlink.camera.ParamKind
 import cloud.micoten.camlink.camera.PreviewCadence
+import cloud.micoten.camlink.camera.PreviewIntervals
 import cloud.micoten.camlink.camera.PreviewJpeg
 import cloud.micoten.camlink.camera.PreviewPoll
 import cloud.micoten.camlink.camera.StorageInfo
@@ -83,13 +86,16 @@ enum class RemoteMode {
 /**
  * AF 键的可见状态。
  *
- * 机身回 `0xC1A3`（AF 结果事件）才算有结果，所以界面要能区分「按键已发出」和 「机身说合上了」。机身侧按键、机背对焦按钮、点选对焦都会推进这个状态。
+ * 对焦完成以机身事件或取景包里的对焦状态为准。
  */
 enum class AfState {
     IDLE,
     WORKING,
     OK,
     FAIL,
+    POSITION_UNAVAILABLE,
+    UNCONFIRMED,
+    ERROR,
 }
 
 enum class ViewfinderPhase {
@@ -193,9 +199,6 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         private const val MAX_PREVIEW_BYTES = 32 * 1024 * 1024
         private const val EVENT_POLL_INTERVAL_MS = 350L
         private const val PREVIEW_EVENT_MIN_INTERVAL_MS = 120L
-
-        /** 等机身回 AF 结果的秒数上限，超了就把界面从「对焦中」放下来。 */
-        private const val AF_TIMEOUT_MS = 4000L
     }
 
     private val prefs = app.getSharedPreferences("camlink", Application.MODE_PRIVATE)
@@ -238,8 +241,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile private var liveJob: Job? = null
     private var eventJob: Job? = null
 
-    /** 每按一次 AF 自增，用来丢弃上一次按下的超时任务。 */
-    private var afToken = 0L
+    @Volatile private var afJob: Job? = null
 
     /** 从相机事件接收的新文件，在同一任务内顺序回传。 */
     private var transferJob: Job? = null
@@ -669,6 +671,16 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 eos.close()
                 throw CameraWifi.explainConnectionError(ctx, network, e)
             }
+            c.onEvent = { code, params ->
+                when (code) {
+                    PtpEvent.REQUEST_GET_EVENT -> eventWake.trySend(Unit)
+                    PtpEvent.AF_RESULT -> {
+                        params.firstOrNull()?.let(eos::receiveAfResult)
+                        eventWake.trySend(Unit)
+                    }
+                    else -> Unit
+                }
+            }
             eos.onEvents = { events, parametersChanged ->
                 if (conn === c) handleEvents(events, parametersChanged)
             }
@@ -710,8 +722,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                                 AppLog.w(TAG, "订阅取景状态失败：${it.message}")
                             }
                     }
-                    val urgent =
-                        _af.value == AfState.WORKING || _busy.value || _intervalRunning.value
+                    val urgent = connectedCamera.isFocusing || _busy.value || _intervalRunning.value
                     delay(
                         if (isPreviewPrioritized() && !urgent) PREVIEW_EVENT_MIN_INTERVAL_MS
                         else 50L
@@ -757,6 +768,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         conn = null
         sessionNetwork = null
         closing?.cancelInterval()
+        cancelAf()
         liveJob?.cancel()
         liveJob = null
         eventJob?.cancel()
@@ -767,7 +779,6 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         filesLoadJob = null
         filesLoaded = false
         autoSavedHandles.clear()
-        afToken++
         _viewfinder.value = ViewfinderState()
         _captureFeedback.value = CaptureFeedback()
         _recentPhoto.value = null
@@ -802,23 +813,6 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         var added: MutableList<CameraEvent.ObjectAdded>? = null
         for (event in events) {
             when (event) {
-                is CameraEvent.Olc -> {
-                    if (_af.value == AfState.WORKING) {
-                        when (event.focusInfo) {
-                            "000000000101" -> publishAf(AfState.OK)
-                            "000000000200" -> publishAf(AfState.FAIL)
-                        }
-                    }
-                }
-                /*
-                 * 机身回报对焦结果：RF/EF 卡口上是「合上了没有」的唯一权威说法。
-                 *
-                 * 结果是 0 为成功、非 0 为失败（服务端与公开实现的约定一致）。
-                 * 这条事件机身自己按 AF 键也会触发，所以界面不能只在按过 AF 时才读。
-                 */
-                is CameraEvent.AfResult -> {
-                    publishAf(if (event.result == 0) AfState.OK else AfState.FAIL)
-                }
                 is CameraEvent.ObjectAdded -> {
                     val files = added ?: ArrayList<CameraEvent.ObjectAdded>(2).also { added = it }
                     files.add(event)
@@ -952,7 +946,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         return withContext(cam) {
             if (camera !== c) return@withContext "相机连接已变化"
             if (
-                _busy.value || _intervalRunning.value || _bulbOpen.value || c.shutterSequenceActive
+                _busy.value ||
+                    _intervalRunning.value ||
+                    _bulbOpen.value ||
+                    c.shutterSequenceActive ||
+                    c.isFocusing
             ) {
                 return@withContext "相机正在对焦或拍摄"
             }
@@ -999,6 +997,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     var lastLog = SystemClock.elapsedRealtime()
                     var frameCount = 0
                     var receiveMs = 0L
+                    val freshIntervals = PreviewIntervals()
                     var duplicateFrames = 0
                     var busyReplies = 0
                     var notReadyReplies = 0
@@ -1027,10 +1026,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                             )
                                 c.keepPreviewSessionAlive()
                             resetStatistics(SystemClock.elapsedRealtime())
+                            freshIntervals.clear()
                             continue
                         }
                         val desired = _lowLatencyPreview.value
-                        if (desired != preferSmall && !_recording.value) {
+                        if (desired != preferSmall && !_recording.value && !c.isFocusing) {
                             preferSmall = desired
                             try {
                                 c.configurePreviewOutput(preferSmall)
@@ -1055,10 +1055,17 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                             val jpeg = poll.jpeg
                             missedSince = null
                             waitingForFrameSince = null
-                            if (preferSmall && _frame.value?.jpeg?.matches(jpeg) == true) {
-                                duplicateFrames++
-                            } else {
+                            val previous = _frame.value?.jpeg
+                            val fresh = previous == null || !previous.image.matches(jpeg.image)
+                            if (previous == null || fresh) {
                                 _frame.value = LiveFrame(jpeg, receivedAt)
+                                freshIntervals.record(receivedAt)
+                            } else {
+                                duplicateFrames++
+                                if (!previous.hasSameFocus(jpeg)) {
+                                    _frame.value =
+                                        LiveFrame(jpeg.copy(image = previous.image), receivedAt)
+                                }
                             }
                             if (
                                 starting &&
@@ -1072,11 +1079,14 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                             frameCount++
                             receiveMs += now - requestAt
                             if (now - lastLog >= 5_000L) {
+                                val freshFps =
+                                    (frameCount - duplicateFrames) * 1000L / (now - lastLog)
                                 AppLog.d(
                                     TAG,
-                                    "相机取景：${frameCount * 1000L / (now - lastLog)} 帧/秒，" +
-                                        "平均取帧命令 ${receiveMs / frameCount}ms，JPEG ${jpeg.length / 1024}KiB，" +
-                                        "重复 $duplicateFrames，忙 $busyReplies，未就绪 $notReadyReplies",
+                                    "相机取景：新帧 ${freshFps}fps，平均命令 ${receiveMs / frameCount}ms，" +
+                                        "JPEG ${jpeg.image.length / 1024}KiB，" +
+                                        "重复 $duplicateFrames，忙 $busyReplies，未就绪 $notReadyReplies，" +
+                                        freshIntervals.report(),
                                 )
                                 resetStatistics(now)
                             }
@@ -1084,6 +1094,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                                 cadence.afterFrame(
                                     SystemClock.elapsedRealtime() - requestAt,
                                     preferSmall,
+                                    fresh,
                                 )
                             )
                         } else if (poll is PreviewPoll.Miss) {
@@ -1096,7 +1107,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                                 if (waitingForFrameSince == null) waitingForFrameSince = now
                             }
                             val waiting = waitingForFrameSince
-                            if (waiting != null && now - waiting >= 1_500L && !_recording.value) {
+                            if (
+                                waiting != null &&
+                                    now - waiting >= 1_500L &&
+                                    !_recording.value &&
+                                    !c.isFocusing
+                            ) {
                                 try {
                                     if (c.selectNextPreviewOutput()) {
                                         missedSince = null
@@ -1123,7 +1139,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                         val reason = e.message ?: e.javaClass.simpleName
                         _status.value = "取景失败：$reason"
                         _frame.value = null
-                        val cleanup = runCatching { c.stopLiveView() }
+                        cancelAf()
+                        val cleanup = runCatching {
+                            awaitShutterTurn(c)
+                            c.stopLiveView()
+                        }
                         if (camera === c) {
                             _viewfinder.compareAndSet(
                                 failedState,
@@ -1148,6 +1168,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val state = _viewfinder.value
         if (!state.phase.isReceivingFrames() && !state.retryStop) return
         _viewfinder.value = ViewfinderState(ViewfinderPhase.STOPPING)
+        cancelAf()
         liveJob?.cancel()
         _frame.value = null
         viewModelScope.launch {
@@ -1195,6 +1216,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun pressShutter() {
         val c = camera ?: return
         if (_intervalRunning.value || !_busy.compareAndSet(false, true)) return
+        cancelAf()
         _captureFeedback.value = CaptureFeedback(CapturePhase.CAPTURING, "正在发送拍摄指令")
         viewModelScope.launch(cam) {
             try {
@@ -1250,48 +1272,43 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun afDrive() = runAf { it.afDrive() }
+    fun afDrive() = runAf(null)
 
-    fun touchAf(x: Int, y: Int) = runAf { camera ->
-        camera.touchAf(x, y)
-        null
+    internal fun touchAf(target: FocusPoint?) {
+        if (target == null) publishAf(AfState.POSITION_UNAVAILABLE) else runAf(target)
     }
 
-    private fun runAf(action: suspend (EosCamera) -> Boolean?) {
+    private fun runAf(target: FocusPoint?) {
         val c = camera ?: return
-        if (
-            _busy.value || _intervalRunning.value || _bulbOpen.value || _af.value == AfState.WORKING
-        )
-            return
-        if (!c.isAutoFocus) return
-        beginAf()
-        viewModelScope.launch(cam) {
-            if (camera !== c) return@launch
-            try {
-                c.drainEvents(maxBatches = 1)
-                if (
-                    camera !== c ||
-                        !c.isAutoFocus ||
-                        _busy.value ||
-                        liveStopping ||
-                        c.shutterSequenceActive
-                ) {
-                    if (camera === c) publishAf(AfState.IDLE)
-                    return@launch
-                }
-                val result = action(c)
-                if (camera === c && result != null && _af.value == AfState.WORKING) {
-                    publishAf(if (result) AfState.OK else AfState.FAIL)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                if (camera === c) {
-                    _status.value = e.message ?: e.javaClass.simpleName
-                    publishAf(AfState.FAIL)
+        if (afJob != null || _busy.value || _intervalRunning.value || _bulbOpen.value) return
+        if (!c.isAutoFocus || liveStopping) return
+        _af.value = AfState.WORKING
+        val job =
+            viewModelScope.launch(cam, start = CoroutineStart.LAZY) {
+                val request = coroutineContext[Job]
+                try {
+                    if (camera !== c) return@launch
+                    val state =
+                        when (c.focus(target)) {
+                            FocusOutcome.FOCUSED -> AfState.OK
+                            FocusOutcome.FAILED -> AfState.FAIL
+                            FocusOutcome.CANCELLED -> AfState.IDLE
+                            FocusOutcome.UNCONFIRMED -> AfState.UNCONFIRMED
+                        }
+                    if (camera === c && afJob === request) publishAf(state)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (camera === c && afJob === request) {
+                        AppLog.w(TAG, "自动对焦操作失败：${e.message ?: e.javaClass.simpleName}")
+                        publishAf(AfState.ERROR)
+                    }
+                } finally {
+                    if (afJob === request) afJob = null
                 }
             }
-        }
+        afJob = job
+        job.start()
     }
 
     private fun publishAf(state: AfState) {
@@ -1299,22 +1316,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         _afSeq.update { it + 1L }
     }
 
-    /**
-     * 先把 AF 键推到「对焦中」，再挂一个超时。
-     *
-     * 机身不回 `0xC1A3` 时不能让圆键一直转圈 —— 那和原来「按了没反应」是同一个体验。 超时就转成失败态，用户至少知道这一下没成，可以再按一次。
-     */
-    private fun beginAf() {
-        afToken++
-        val token = afToken
-        _af.value = AfState.WORKING
-        viewModelScope.launch {
-            delay(AF_TIMEOUT_MS)
-            if (afToken == token && _af.value == AfState.WORKING) {
-                _af.value = AfState.FAIL
-                _status.value = str(R.string.msg_af_no_result)
-            }
-        }
+    private fun cancelAf() {
+        val job = afJob ?: return
+        afJob = null
+        job.cancel()
+        if (_af.value == AfState.WORKING) publishAf(AfState.IDLE)
     }
 
     private suspend fun record(c: EosCamera) {
@@ -1342,6 +1348,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 _exposureMode.value == ExposureMode.MOVIE
         )
             return
+        cancelAf()
         _intervalStopping.value = false
         _intervalRunning.value = true
         _captureFeedback.value = CaptureFeedback()
@@ -1547,7 +1554,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     c.captureInProgress ||
                     _bulbOpen.value ||
                     _recording.value ||
-                    _af.value == AfState.WORKING ||
+                    c.isFocusing ||
                     c.shutterSequenceActive ||
                     (transferHandle != null &&
                         isPreviewPrioritized() &&
@@ -1559,7 +1566,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun awaitShutterTurn(c: EosCamera) {
-        while (camera === c && c.shutterSequenceActive) delay(20)
+        while (camera === c && (c.shutterSequenceActive || c.isFocusing)) delay(20)
         if (camera !== c) throw CancellationException("相机会话已关闭")
     }
 
@@ -1576,6 +1583,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                             file,
                             out,
                             beforeRead = { awaitReadTurn(c, transferHandle = file.handle) },
+                            previewPriority = ::isPreviewPrioritized,
                         ) { done, total ->
                             val percent =
                                 if (total > 0L && done >= 0L)

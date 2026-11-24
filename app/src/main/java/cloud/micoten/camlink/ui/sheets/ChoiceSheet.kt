@@ -53,14 +53,7 @@ fun ChoiceSheet(
     onApply: suspend (Int) -> String?,
     onDismiss: () -> Unit,
 ) {
-    val table =
-        remember(choices, kind) {
-            if (kind == ParamKind.EXPOSURE_COMP)
-                choices.sortedWith(
-                    compareBy<Choice> { it.code >= 0xff }.thenByDescending { it.code }
-                )
-            else choices
-        }
+    val table = choices
     var picked by remember(kind) { mutableStateOf(selectedCode) }
     var error by remember(kind) { mutableStateOf<String?>(null) }
     var applying by remember(kind) { mutableStateOf(false) }

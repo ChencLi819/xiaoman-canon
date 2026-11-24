@@ -8,7 +8,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersion = "1.7.8"
+val appVersion = "1.8.2"
 
 android {
     /* 包名沿用 cloud.micoten.camlink 以免搬动 15 个源文件；
@@ -20,7 +20,7 @@ android {
         applicationId = "cloud.micoten.xiaomancanon"
         minSdk = 26
         targetSdk = 34
-        versionCode = 27
+        versionCode = 33
         versionName = appVersion
         vectorDrawables { useSupportLibrary = true }
     }

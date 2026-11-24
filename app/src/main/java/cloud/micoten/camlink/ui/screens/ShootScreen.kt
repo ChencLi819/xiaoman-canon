@@ -45,12 +45,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import cloud.micoten.camlink.R
 import cloud.micoten.camlink.ble.CanonBle
 import cloud.micoten.camlink.camera.CameraFile
 import cloud.micoten.camlink.camera.EosCamera
@@ -230,9 +232,9 @@ fun ShootScreen(
                 afSeq = afSeq,
                 canFocus =
                     online && streaming && autoFocus && ready && !bulb && af != AfState.WORKING,
-                onFocus = { point, x, y ->
-                    target = point
-                    vm.touchAf(x, y)
+                onFocus = { point, cameraPoint ->
+                    target = point.takeIf { cameraPoint != null }
+                    vm.touchAf(cameraPoint)
                 },
                 onPrimary = { if (online) vm.startLive() else connectSheet = true },
                 onStop = vm::stopLive,
@@ -276,7 +278,11 @@ fun ShootScreen(
                     interval -> "准备定时拍摄"
                     visibleCapture != CapturePhase.IDLE -> capture.message
                     autoFocus && af == AfState.WORKING -> "正在对焦"
+                    autoFocus && af == AfState.POSITION_UNAVAILABLE -> "相机对焦坐标未就绪"
+                    autoFocus && af == AfState.UNCONFIRMED ->
+                        stringResource(R.string.msg_af_no_result)
                     autoFocus && af == AfState.FAIL -> "未合焦"
+                    autoFocus && af == AfState.ERROR -> "对焦操作失败"
                     !online && bleReady -> bleMessage
                     else -> ""
                 }
@@ -334,7 +340,8 @@ fun ShootScreen(
                         manualFocus -> "手动对焦"
                         online && !autoFocus -> "对焦未知"
                         af == AfState.OK -> "已合焦"
-                        af == AfState.FAIL -> "重试 AF"
+                        af == AfState.FAIL || af == AfState.UNCONFIRMED || af == AfState.ERROR ->
+                            "重试 AF"
                         af == AfState.WORKING -> "对焦中"
                         else -> "自动对焦"
                     },
@@ -348,7 +355,8 @@ fun ShootScreen(
                     tone =
                         when (af) {
                             AfState.OK -> Xm.ok
-                            AfState.FAIL -> Xm.rec
+                            AfState.FAIL,
+                            AfState.ERROR -> Xm.rec
                             else -> UiTone.ink
                         },
                 ) {

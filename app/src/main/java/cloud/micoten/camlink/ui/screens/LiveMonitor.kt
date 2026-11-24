@@ -55,7 +55,12 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import cloud.micoten.camlink.camera.ExposureMode
+import cloud.micoten.camlink.camera.FocusGeometry
+import cloud.micoten.camlink.camera.FocusPoint
 import cloud.micoten.camlink.camera.PreviewFocusArea
+import cloud.micoten.camlink.camera.PreviewImage
+import cloud.micoten.camlink.camera.PreviewIntervals
+import cloud.micoten.camlink.camera.TouchFocusStatus
 import cloud.micoten.camlink.ui.AfState
 import cloud.micoten.camlink.ui.Link
 import cloud.micoten.camlink.ui.LiveFrame
@@ -95,7 +100,7 @@ internal fun ViewfinderDisplay(
     af: AfState,
     afSeq: Long,
     canFocus: Boolean,
-    onFocus: (Offset, Int, Int) -> Unit,
+    onFocus: (Offset, FocusPoint?) -> Unit,
     onPrimary: () -> Unit,
     onStop: () -> Unit,
     onGrid: () -> Unit,
@@ -112,27 +117,48 @@ internal fun ViewfinderDisplay(
         if (!displayFrames) return@LaunchedEffect
         withContext(Dispatchers.Default) {
             var lastPublished = 0L
+            var lastImage: PreviewImage? = null
+            var lastBitmap: ImageBitmap? = null
             frames.collect { frame ->
                 if (frame == null) {
                     bitmap.value = null
                     lastPublished = 0L
+                    lastImage = null
+                    lastBitmap = null
                     return@collect
                 }
                 val jpeg = frame.jpeg
-                val start = SystemClock.elapsedRealtimeNanos()
+                val source = jpeg.image
+                var decodeNanos = 0L
                 val image =
-                    BitmapFactory.decodeByteArray(jpeg.bytes, jpeg.offset, jpeg.length)
-                        ?.asImageBitmap() ?: return@collect
+                    lastBitmap?.takeIf { source === lastImage }
+                        ?: run {
+                            val start = SystemClock.elapsedRealtimeNanos()
+                            val decoded =
+                                BitmapFactory.decodeByteArray(
+                                        source.bytes,
+                                        source.offset,
+                                        source.length,
+                                    )
+                                    ?.asImageBitmap() ?: return@collect
+                            decodeNanos = SystemClock.elapsedRealtimeNanos() - start
+                            lastImage = source
+                            lastBitmap = decoded
+                            decoded
+                        }
                 coroutineContext.ensureActive()
                 val newest = frames.value ?: return@collect
                 val now = SystemClock.elapsedRealtimeNanos()
+                val imageChanged = bitmap.value?.image !== image
                 if (
                     lowLatency &&
+                        imageChanged &&
                         lastPublished != 0L &&
                         shouldSkipDecodedFrame(
                             newest !== frame,
                             now - frame.receivedAtNanos,
                             now - lastPublished,
+                            decodeNanos,
                         )
                 ) {
                     metrics.skipped.incrementAndGet()
@@ -142,12 +168,12 @@ internal fun ViewfinderDisplay(
                     DecodedPreview(
                         image,
                         frame.receivedAtNanos,
-                        now - start,
-                        jpeg.focusWidth.takeIf { it > 0 } ?: image.width,
-                        jpeg.focusHeight.takeIf { it > 0 } ?: image.height,
+                        decodeNanos,
+                        jpeg.focusGeometry,
                         jpeg.focusArea,
+                        jpeg.focusStatus,
                     )
-                lastPublished = now
+                if (imageChanged) lastPublished = now
             }
         }
     }
@@ -202,12 +228,7 @@ internal fun ViewfinderDisplay(
                         )
                     reportFocus.value(
                         normalized,
-                        (normalized.x * preview.focusWidth)
-                            .toInt()
-                            .coerceIn(0, preview.focusWidth - 1),
-                        (normalized.y * preview.focusHeight)
-                            .toInt()
-                            .coerceIn(0, preview.focusHeight - 1),
+                        preview.focusGeometry?.pointAt(normalized.x, normalized.y),
                     )
                 }
             }
@@ -249,13 +270,18 @@ internal fun ViewfinderDisplay(
                             }
                         }
                         val cameraFocus = preview.focusArea
-                        if (cameraFocus != null) {
-                            val scaleX = rect.width / preview.focusWidth
-                            val scaleY = rect.height / preview.focusHeight
+                        val geometry = preview.focusGeometry
+                        if (
+                            cameraFocus != null &&
+                                geometry != null &&
+                                (focus == null || af != AfState.WORKING)
+                        ) {
+                            val scaleX = rect.width / geometry.width
+                            val scaleY = rect.height / geometry.height
                             val color =
-                                when (cameraFocus.status) {
-                                    0x31 -> DarkXm.ok
-                                    0x32 -> DarkXm.rec
+                                when (preview.focusStatus) {
+                                    TouchFocusStatus.FOCUSED -> DarkXm.ok
+                                    TouchFocusStatus.FAILED -> DarkXm.rec
                                     else -> DarkXm.accent
                                 }
                             drawRoundRect(
@@ -373,16 +399,18 @@ private class DecodedPreview(
     val image: ImageBitmap,
     val receivedAt: Long,
     val decodeNanos: Long,
-    val focusWidth: Int,
-    val focusHeight: Int,
+    val focusGeometry: FocusGeometry?,
     val focusArea: PreviewFocusArea?,
+    val focusStatus: TouchFocusStatus?,
 )
 
 internal fun shouldSkipDecodedFrame(
     hasNewer: Boolean,
     frameAgeNanos: Long,
     sincePublishedNanos: Long,
-): Boolean = hasNewer && frameAgeNanos >= 50_000_000L && sincePublishedNanos < 120_000_000L
+    decodeNanos: Long,
+): Boolean =
+    hasNewer && frameAgeNanos >= 50_000_000L && sincePublishedNanos + decodeNanos < 66_000_000L
 
 /** 只统计首次进入绘制的帧，构图线或 AF 动画的重绘不计入帧率。 */
 private class PreviewRenderMetrics {
@@ -390,26 +418,35 @@ private class PreviewRenderMetrics {
     private var lastFrameAt = 0L
     private var windowStart = 0L
     private var frames = 0
+    private var decodedFrames = 0
     private var decodeNanos = 0L
     private var phoneNanos = 0L
+    private val intervals = PreviewIntervals()
 
     fun rendered(frame: DecodedPreview): String? {
         if (frame.receivedAt == lastFrameAt) return null
         lastFrameAt = frame.receivedAt
         val now = SystemClock.elapsedRealtimeNanos()
+        intervals.record(now)
         if (windowStart == 0L) windowStart = now
         frames++
-        decodeNanos += frame.decodeNanos
+        if (frame.decodeNanos > 0L) {
+            decodedFrames++
+            decodeNanos += frame.decodeNanos
+        }
         phoneNanos += now - frame.receivedAt
         val period = now - windowStart
         if (period < 5_000_000_000L) return null
         val report =
             "手机取景：${frames * 1_000_000_000L / period} 帧/秒，" +
-                "平均解码 ${decodeNanos / frames / 1_000_000}ms，" +
+                "平均解码 ${decodeNanos / maxOf(decodedFrames, 1) / 1_000_000}ms，" +
                 "收帧到绘制 ${phoneNanos / frames / 1_000_000}ms，" +
-                "${frame.image.width}×${frame.image.height}，跳过过期帧 ${skipped.getAndSet(0)}"
+                "${frame.image.width}×${frame.image.height}，复用解码 ${frames - decodedFrames} 次，" +
+                "跳过过期帧 ${skipped.getAndSet(0)}，" +
+                intervals.report()
         windowStart = now
         frames = 0
+        decodedFrames = 0
         decodeNanos = 0
         phoneNanos = 0
         return report

@@ -215,8 +215,9 @@ val Eos200DII: CameraProfile =
                 ParamKind.ISO to
                     (EosValues.ISO.filter { it.code == 0x0000 } +
                         between(EosValues.ISO, 0x0048, 0x0090)),
-                /* 曝光补偿整档 1/3 步，-3.0 … +3.0，全留 */
-                ParamKind.EXPOSURE_COMP to EosValues.EXPOSURE_COMP,
+                /* 相机还没上报可选档位时，使用引导模式支持的 ±3 EV。 */
+                ParamKind.EXPOSURE_COMP to
+                    EosValues.EXPOSURE_COMP.filter { it.code.toByte().toInt() in -0x18..0x18 },
                 ParamKind.WHITE_BALANCE to EosValues.WHITE_BALANCE,
             ),
     )

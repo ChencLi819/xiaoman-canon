@@ -81,6 +81,20 @@ sealed class CameraEvent {
     data class Raw(val eventCode: Int, val size: Int) : CameraEvent()
 }
 
+/** 只从机身已上报的对焦状态取结果，空记录和开始对焦仍需等待。 */
+internal fun CameraEvent.focusResult(): Boolean? =
+    when (this) {
+        is CameraEvent.Olc ->
+            when (focusInfo?.take(12)) {
+                "000000000100", "000000000101" -> true
+                "000000000200", "000000000201", "000000000202" -> false
+                else -> null
+            }
+        is CameraEvent.AfResult -> result == 0
+        is CameraEvent.FocusPointEx -> true.takeIf { selected > 0 }
+        else -> null
+    }
+
 /**
  * `GetEvent` 数据块解包器。
  *
@@ -226,7 +240,8 @@ object EosEventParser {
         }
         val count = le32(data, base + 16)
         if (count !in 0..((size - 20) / 4)) return CameraEvent.AvailListChanged(propCode)
-        val values = List(count) { le32(data, base + 20 + it * 4).toLong() and 0xFFFFFFFFL }
+        val mask = if (propCode == PtpProp.EXPOSURE_COMPENSATION) 0xFFL else 0xFFFFFFFFL
+        val values = List(count) { le32(data, base + 20 + it * 4).toLong() and mask }
         return CameraEvent.AvailListChanged(propCode, values)
     }
 
@@ -236,15 +251,17 @@ object EosEventParser {
      */
     private fun parseFocusInfoEx(data: ByteArray, base: Int, len: Int): CameraEvent? {
         if (len < 20) return null
+        val size = le32(data, base)
+        if (size !in 20..len) return null
         val total = le16(data, base + 8)
         val used = le16(data, base + 10)
         if (total == 0 || used == 0) return CameraEvent.FocusPointEx(0, 0)
+        if (used > total || 20 + total * 8 + (total + 7) / 8 > size) return null
 
         val bitfieldStart = base + 20 + total * 8
         var selected = 0
         for (i in 0 until used) {
             val idx = bitfieldStart + i / 8
-            if (idx >= base + len) break
             if ((data[idx].toInt() shr (i % 8)) and 1 != 0) selected++
         }
         return CameraEvent.FocusPointEx(selected, used)
@@ -259,7 +276,7 @@ object EosEventParser {
      * 各字段记录
      */
     private fun parseOlc(data: ByteArray, base: Int, size: Int, olcVersion: Int): CameraEvent? {
-        if (olcVersion !in 7 until OLC_SIZES.size || size < 16) {
+        if (size < 16) {
             return CameraEvent.Raw(PtpEvent.OLC_INFO_CHANGED, size)
         }
 
@@ -269,9 +286,15 @@ object EosEventParser {
             return CameraEvent.Raw(PtpEvent.OLC_INFO_CHANGED, size)
         }
 
+        val mask = le16(data, base + 12)
+        // 单独的 AF 记录不依赖其它字段的长度，因此可以在版本到达之前读取。
+        if (mask == 0x0100 && size - 16 in 6..7) {
+            return CameraEvent.Olc(focusInfo = hex(data, base + 16, size - 16))
+        }
+        if (olcVersion !in 7 until OLC_SIZES.size)
+            return CameraEvent.Raw(PtpEvent.OLC_INFO_CHANGED, size)
         val ver = olcVersion
         val sizes = OLC_SIZES[ver]
-        val mask = le16(data, base + 12)
 
         var shutter: Int? = null
         var aperture: Int? = null
