@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小满·卡农 桌面图标前景层（gpt-image 设计稿转绘）。
+
+  设计稿：tools/icon/20261122-004401_gpt-image-2.6.png —— 珊瑚底上一个白色镜头正面。
+  与小满·日记同源的语言：纯色底 + 单色白线图形，留白给足。
+
+  几何全部由圆规算出，不是描图：
+    外环  r=23 描边 4  —— 镜筒；
+    内环  r=15.5 描边 2.5 —— 镜片压圈，六道叶片的端头收进这道环里；
+    叶片  六条风车式线段：从六边形顶点起笔、穿过整条边、再延伸到 R=15 圆上 ——
+          中央围出闭合六边形光圈，外段是伸到压圈的叶片。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 镜筒：珊瑚底上的白外环 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4"
+        android:pathData="M54,31 a23,23 0 1 1 0,46 a23,23 0 1 1 0,-46 z" />
+
+    <!-- 镜片压圈：白内环 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.5"
+        android:pathData="M54,38.5 a15.5,15.5 0 1 1 0,31 a15.5,15.5 0 1 1 0,-31 z" />
+
+    <!-- 光圈叶片：顶点起笔过整条边，再伸到压圈，围出中央六边形 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M60.50,57.75 L45.54,66.39 M54.00,61.51 L39.04,52.87 M47.50,57.75 L47.50,40.48 M47.50,50.25 L62.46,41.61 M54.00,46.49 L68.96,55.13 M60.50,50.25 L60.50,67.52" />
+</vector>

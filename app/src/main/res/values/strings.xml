@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小满·卡农</string>
+
+    <string name="tab_shoot">拍摄</string>
+    <string name="tab_gallery">图库</string>
+    <string name="tab_log">日志</string>
+
+    <string name="btn_connect">连接</string>
+    <string name="btn_disconnect">断开</string>
+    <string name="btn_lv_on">开取景</string>
+    <string name="btn_lv_off">关取景</string>
+    <string name="btn_shoot">快门</string>
+    <string name="btn_focus">对焦</string>
+    <string name="btn_movie">视频</string>
+    <string name="btn_still">拍照</string>
+    <string name="btn_rec">录制</string>
+    <string name="btn_rec_stop">停录</string>
+    <string name="btn_bulb">B门</string>
+    <string name="btn_bulb_stop">关B门</string>
+    <string name="btn_interval">间隔</string>
+    <string name="btn_interval_stop">停间隔</string>
+
+    <string name="hint_disconnected">未连接相机</string>
+    <string name="hint_connecting">正在连接相机…</string>
+
+    <string name="label_tv">Tv</string>
+    <string name="label_av">Av</string>
+    <string name="label_iso">ISO</string>
+    <string name="label_ec">EV</string>
+    <string name="label_wb">WB</string>
+    <string name="label_shots">可拍</string>
+    <string name="label_battery">电量</string>
+    <string name="label_auto_transfer">拍摄后回传</string>
+    <string name="label_af">半按对焦</string>
+
+    <string name="status_ready">就绪</string>
+    <string name="placeholder_value">—</string>
+
+    <string name="gallery_empty">无文件</string>
+    <string name="gallery_count_fmt">共 %1$d</string>
+    <string name="log_clear">清空</string>
+    <string name="log_empty">—</string>
+    <string name="btn_refresh">刷新</string>
+    <string name="btn_save">保存</string>
+    <string name="btn_close">关闭</string>
+    <string name="btn_start">开始</string>
+    <string name="btn_cancel">取消</string>
+
+    <string name="dlg_wifi_title">连接相机</string>
+    <string name="hint_ssid">热点名称</string>
+    <string name="hint_pass">密码</string>
+
+    <string name="dlg_interval_title">间隔拍摄</string>
+    <string name="hint_count">张数</string>
+    <string name="hint_interval_sec">间隔（秒）</string>
+    <string name="hint_delay_sec">首张延时（秒）</string>
+
+    <string name="msg_saving">保存中 %1$d%%</string>
+    <string name="msg_saving_plain">保存中</string>
+    <string name="msg_preview_none">无预览</string>
+    <string name="msg_saved">已保存 %1$s</string>
+    <string name="msg_save_existing">相册里已有 %1$s</string>
+    <string name="msg_save_failed">保存失败：%1$s</string>
+    <string name="msg_shot_done">拍摄完成 %1$d 张</string>
+    <string name="msg_no_host">未发现相机主机</string>
+    <string name="msg_af_no_result">未收到对焦结果</string>
+    <string name="msg_focus_manual">镜头上是 MF，拨到 AF</string>
+
+    <string name="st_offline">未连接</string>
+    <string name="st_scanning">扫描热点</string>
+    <string name="st_connecting_wifi">连接热点 %1$s</string>
+    <string name="st_locating">探测主机</string>
+    <string name="st_opening">初始化相机</string>
+    <string name="st_shooting">拍摄中</string>
+    <string name="st_lv_waiting">取景等待画面</string>
+    <string name="st_lv_on">实时取景</string>
+    <string name="st_recording">录制 %1$s</string>
+    <string name="st_rec_fmt">● %1$s</string>
+    <string name="st_bulb">BULB</string>
+</resources>

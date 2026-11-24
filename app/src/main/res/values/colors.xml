@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 窗口底色：全应用深色仪器面，与 ui/theme/Color.kt 的 DarkXm.bg 对齐 -->
+    <color name="window_bg">#FF141316</color>
+    <color name="ic_launcher_background">#FFE86A7C</color>
+    <color name="xm_accent">#FFE86A7C</color>
+</resources>
