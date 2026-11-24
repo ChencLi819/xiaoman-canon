@@ -1,6 +1,6 @@
 # 小满·卡农
 
-小满·卡农是通过 Wi‑Fi PTP/IP 控制相机的 Android 应用。目前仅支持佳能 EOS 200D II（EOS 250D、Rebel SL3、Kiss X10）。
+小满·卡农是通过 Wi‑Fi PTP/IP 控制相机的 Android 应用。目前仅测试了佳能 EOS 200D II（EOS 250D、Rebel SL3、Kiss X10）。
 
 ## 功能
 
